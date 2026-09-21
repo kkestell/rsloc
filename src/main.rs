@@ -380,7 +380,19 @@ impl Complexity {
 }
 
 impl<'ast> Visit<'ast> for Complexity {
+    // Test code is reported in its own column, so it scores nothing here. The
+    // checks mirror `TestLines` exactly, so the two columns stay in agreement.
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if item.attrs.iter().any(is_test_cfg) {
+            return;
+        }
+        visit::visit_item_mod(self, item);
+    }
+
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if item.attrs.iter().any(is_test_attribute) {
+            return;
+        }
         self.visit_body(&item.sig.ident, &item.block);
     }
 
@@ -730,6 +742,38 @@ mod tests {
 
     fn complexity(source: &str) -> usize {
         count_source(source).unwrap().complexity
+    }
+
+    #[test]
+    fn ignores_test_code() {
+        let source = r#"fn prod(a: bool) {
+    if a {
+        println!("one");
+    }
+}
+
+#[test]
+fn free_test(a: bool) {
+    if a {
+        for _ in 0..3 {
+            println!("ignored");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    fn helper(a: bool, b: bool) {
+        if a && b {
+            while a {
+                println!("ignored");
+            }
+        }
+    }
+}
+"#;
+
+        assert_eq!(complexity(source), 1);
     }
 
     #[test]
