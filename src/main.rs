@@ -6,7 +6,7 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-use proc_macro2::{Ident, Span};
+use proc_macro2::{Ident, LineColumn, Span};
 use serde::Serialize;
 use syn::{
     Attribute, Block, Expr, ExprIf, Meta, Token,
@@ -39,6 +39,10 @@ struct Cli {
 
     #[arg(short = 'f', long, value_enum, default_value = "tabular")]
     format: OutputFormat,
+
+    /// List each file's items instead of totalling the file
+    #[arg(short = 'i', long)]
+    items: bool,
 
     #[arg(value_name = "FILES OR DIRECTORIES", default_value = ".")]
     paths: Vec<PathBuf>,
@@ -80,6 +84,20 @@ struct FileCounts {
     test: usize,
     doc: usize,
     cog: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    items: Option<Vec<ItemCounts>>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct ItemCounts {
+    name: String,
+    kind: &'static str,
+    line: usize,
+    prod: usize,
+    doc: usize,
+    cog: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    items: Vec<ItemCounts>,
 }
 
 fn main() {
@@ -108,8 +126,9 @@ fn run() -> Result<(), String> {
     for path in paths {
         let source =
             fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-        let counts = count_source(&source)
+        let parsed = ParsedSource::parse(&source)
             .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+        let counts = parsed.counts();
         let file = path
             .strip_prefix(&current_dir)
             .unwrap_or(&path)
@@ -122,10 +141,12 @@ fn run() -> Result<(), String> {
             test: counts.tests,
             doc: counts.comments,
             cog: counts.complexity,
+            items: cli.items.then(|| parsed.items()),
         });
     }
 
     match cli.format {
+        OutputFormat::Tabular if cli.items => print_items_tabular(&files),
         OutputFormat::Tabular => print_tabular(&files),
         OutputFormat::Json => print_json(&files)?,
     }
@@ -234,24 +255,332 @@ fn print_tabular(files: &[FileCounts]) {
     );
 }
 
+struct ItemRow<'a> {
+    location: String,
+    name: String,
+    item: &'a ItemCounts,
+}
+
+fn print_items_tabular(files: &[FileCounts]) {
+    let mut rows = Vec::new();
+    for file in files {
+        if let Some(items) = &file.items {
+            flatten_items(&file.file, items, 0, &mut rows);
+        }
+    }
+
+    // The totals are the file totals, which also count lines outside any
+    // listed item, such as `use` declarations.
+    let prod_total: usize = files.iter().map(|file| file.prod).sum();
+    let doc_total: usize = files.iter().map(|file| file.doc).sum();
+
+    let location_width = column_width(
+        "Location",
+        rows.iter().map(|row| row.location.chars().count()),
+    );
+    let name_width = column_width("Item", rows.iter().map(|row| row.name.chars().count()));
+    let kind_width = column_width("Kind", rows.iter().map(|row| row.item.kind.len()));
+    let prod_width = column_width(
+        "Prod",
+        rows.iter()
+            .map(|row| row.item.prod)
+            .chain([prod_total])
+            .map(digits),
+    );
+    let doc_width = column_width(
+        "Doc",
+        rows.iter()
+            .map(|row| row.item.doc)
+            .chain([doc_total])
+            .map(digits),
+    );
+    let cog_width = column_width("Cog", rows.iter().map(|row| digits(row.item.cog)));
+
+    let rule = "─"
+        .repeat(location_width + name_width + kind_width + prod_width + doc_width + cog_width + 10);
+
+    println!(
+        "{:<location_width$}  {:<name_width$}  {:<kind_width$}  {:>prod_width$}  {:>doc_width$}  {:>cog_width$}",
+        "Location", "Item", "Kind", "Prod", "Doc", "Cog"
+    );
+    println!("{rule}");
+    for row in &rows {
+        println!(
+            "{:<location_width$}  {:<name_width$}  {:<kind_width$}  {:>prod_width$}  {:>doc_width$}  {:>cog_width$}",
+            row.location, row.name, row.item.kind, row.item.prod, row.item.doc, row.item.cog
+        );
+    }
+    println!("{rule}");
+    println!(
+        "{:<location_width$}  {:<name_width$}  {:<kind_width$}  {:>prod_width$}  {:>doc_width$}",
+        "", "", "", prod_total, doc_total
+    );
+}
+
+fn flatten_items<'a>(
+    file: &str,
+    items: &'a [ItemCounts],
+    depth: usize,
+    rows: &mut Vec<ItemRow<'a>>,
+) {
+    for item in items {
+        rows.push(ItemRow {
+            location: format!("{file}:{}", item.line),
+            name: format!("{:indent$}{}", "", item.name, indent = depth * 2),
+            item,
+        });
+        flatten_items(file, &item.items, depth + 1, rows);
+    }
+}
+
+fn column_width(header: &str, widths: impl Iterator<Item = usize>) -> usize {
+    widths.max().unwrap_or(0).max(header.len())
+}
+
+fn digits(value: usize) -> usize {
+    value.to_string().len()
+}
+
 fn print_json(files: &[FileCounts]) -> Result<(), String> {
     let output = serde_json::to_string_pretty(files).map_err(|error| error.to_string())?;
     println!("{output}");
     Ok(())
 }
 
-fn count_source(source: &str) -> syn::Result<Counts> {
-    let syntax = syn::parse_file(source)?;
-    let mut test_lines = TestLines::default();
-    test_lines.visit_file(&syntax);
+struct ParsedSource<'a> {
+    source: &'a str,
+    syntax: syn::File,
+    lines: Vec<LineKind>,
+    test_lines: BTreeSet<usize>,
+}
 
+impl<'a> ParsedSource<'a> {
+    fn parse(source: &'a str) -> syn::Result<Self> {
+        let syntax = syn::parse_file(source)?;
+        let mut test_lines = TestLines::default();
+        test_lines.visit_file(&syntax);
+
+        Ok(Self {
+            source,
+            syntax,
+            lines: classify_lines(source),
+            test_lines: test_lines.lines,
+        })
+    }
+
+    fn counts(&self) -> Counts {
+        let mut counts = count_lines(&self.lines, &self.test_lines);
+        counts.complexity = score(|visitor| visitor.visit_file(&self.syntax));
+        counts
+    }
+
+    fn items(&self) -> Vec<ItemCounts> {
+        self.module_items(&self.syntax.items)
+    }
+
+    fn module_items(&self, items: &[syn::Item]) -> Vec<ItemCounts> {
+        items
+            .iter()
+            .filter(|item| !is_test_item(item))
+            .filter_map(|item| self.item(item))
+            .collect()
+    }
+
+    fn item(&self, item: &syn::Item) -> Option<ItemCounts> {
+        use syn::Item;
+
+        let (name, kind, anchor, children) = match item {
+            Item::Const(item) => (
+                item.ident.to_string(),
+                "const",
+                item.ident.span(),
+                Vec::new(),
+            ),
+            Item::Enum(item) => (
+                item.ident.to_string(),
+                "enum",
+                item.ident.span(),
+                Vec::new(),
+            ),
+            Item::Fn(item) => (
+                item.sig.ident.to_string(),
+                "fn",
+                item.sig.ident.span(),
+                Vec::new(),
+            ),
+            Item::ForeignMod(item) => {
+                let span = item.abi.span();
+                let name = self.source_text(span.start(), span.end());
+                (name, "extern", span, Vec::new())
+            }
+            Item::Impl(item) => {
+                let start = item.impl_token.span.start();
+                let name = self.source_text(start, item.self_ty.span().end());
+                let methods = item
+                    .items
+                    .iter()
+                    .filter_map(|member| match member {
+                        syn::ImplItem::Fn(method) => Some(self.item_counts(
+                            &method.sig.ident,
+                            method.span(),
+                            score(|visitor| visitor.visit_impl_item_fn(method)),
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+                (name, "impl", item.impl_token.span, methods)
+            }
+            Item::Macro(item) => {
+                let name = match &item.ident {
+                    Some(ident) => ident.to_string(),
+                    None => format!("{}!", path_text(&item.mac.path)),
+                };
+                (name, "macro", item.mac.path.span(), Vec::new())
+            }
+            Item::Mod(item) => {
+                let children = item
+                    .content
+                    .as_ref()
+                    .map(|(_, items)| self.module_items(items))
+                    .unwrap_or_default();
+                (item.ident.to_string(), "mod", item.ident.span(), children)
+            }
+            Item::Static(item) => (
+                item.ident.to_string(),
+                "static",
+                item.ident.span(),
+                Vec::new(),
+            ),
+            Item::Struct(item) => (
+                item.ident.to_string(),
+                "struct",
+                item.ident.span(),
+                Vec::new(),
+            ),
+            Item::Trait(item) => {
+                let methods = item
+                    .items
+                    .iter()
+                    .filter_map(|member| match member {
+                        syn::TraitItem::Fn(method) => Some(self.item_counts(
+                            &method.sig.ident,
+                            method.span(),
+                            score(|visitor| visitor.visit_trait_item_fn(method)),
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+                (item.ident.to_string(), "trait", item.ident.span(), methods)
+            }
+            Item::TraitAlias(item) => (
+                item.ident.to_string(),
+                "trait",
+                item.ident.span(),
+                Vec::new(),
+            ),
+            Item::Type(item) => (
+                item.ident.to_string(),
+                "type",
+                item.ident.span(),
+                Vec::new(),
+            ),
+            Item::Union(item) => (
+                item.ident.to_string(),
+                "union",
+                item.ident.span(),
+                Vec::new(),
+            ),
+            _ => return None,
+        };
+
+        let (prod, doc) = self.count_extent(item.span());
+        Some(ItemCounts {
+            name,
+            kind,
+            line: anchor.start().line,
+            prod,
+            doc,
+            cog: score(|visitor| visitor.visit_item(item)),
+            items: children,
+        })
+    }
+
+    fn item_counts(&self, ident: &Ident, extent: Span, cog: usize) -> ItemCounts {
+        let (prod, doc) = self.count_extent(extent);
+        ItemCounts {
+            name: ident.to_string(),
+            kind: "fn",
+            line: ident.span().start().line,
+            prod,
+            doc,
+            cog,
+            items: Vec::new(),
+        }
+    }
+
+    /// Counts the production code and comment lines in an item's extent. The
+    /// extent already includes `///` doc comments; plain comments directly
+    /// above the item, with no blank line in between, belong to it too.
+    fn count_extent(&self, extent: Span) -> (usize, usize) {
+        let is_leading_comment = |line: usize| {
+            self.lines[line - 1] == LineKind::Comment && !self.test_lines.contains(&line)
+        };
+
+        let mut start = extent.start().line;
+        while start > 1 && is_leading_comment(start - 1) {
+            start -= 1;
+        }
+
+        let mut prod = 0;
+        let mut doc = 0;
+        for line in start..=extent.end().line {
+            if self.test_lines.contains(&line) {
+                continue;
+            }
+            match self.lines[line - 1] {
+                LineKind::Code => prod += 1,
+                LineKind::Comment => doc += 1,
+                LineKind::Blank => {}
+            }
+        }
+
+        (prod, doc)
+    }
+
+    /// The source between two positions, with runs of whitespace collapsed.
+    fn source_text(&self, start: LineColumn, end: LineColumn) -> String {
+        let mut text = String::new();
+        for (number, line) in (start.line..=end.line).zip(self.source.lines().skip(start.line - 1))
+        {
+            let from = if number == start.line {
+                start.column
+            } else {
+                0
+            };
+            let to = if number == end.line {
+                end.column
+            } else {
+                usize::MAX
+            };
+            text.extend(line.chars().take(to).skip(from));
+            text.push(' ');
+        }
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+}
+
+fn score(visit: impl FnOnce(&mut Complexity)) -> usize {
     let mut complexity = Complexity::default();
-    complexity.visit_file(&syntax);
+    visit(&mut complexity);
+    complexity.score
+}
 
-    let mut counts = count_lines(source, &test_lines.lines);
-    counts.complexity = complexity.score;
-
-    Ok(counts)
+fn path_text(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
 }
 
 #[derive(Default)]
@@ -278,6 +607,14 @@ impl<'ast> Visit<'ast> for TestLines {
             self.mark_span(item.span());
         }
         visit::visit_item_mod(self, item);
+    }
+}
+
+fn is_test_item(item: &syn::Item) -> bool {
+    match item {
+        syn::Item::Fn(item) => item.attrs.iter().any(is_test_attribute),
+        syn::Item::Mod(item) => item.attrs.iter().any(is_test_cfg),
+        _ => false,
     }
 }
 
@@ -526,22 +863,36 @@ fn logical_op(operator: &syn::BinOp) -> Option<LogicalOp> {
     }
 }
 
-fn count_lines(source: &str, test_lines: &BTreeSet<usize>) -> Counts {
-    let mut counts = Counts::default();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineKind {
+    Blank,
+    Code,
+    Comment,
+}
+
+fn classify_lines(source: &str) -> Vec<LineKind> {
     let mut scanner = LineScanner::default();
+    source
+        .lines()
+        .map(|line| match scanner.scan_line(line) {
+            (true, _) => LineKind::Code,
+            (false, true) => LineKind::Comment,
+            (false, false) => LineKind::Blank,
+        })
+        .collect()
+}
 
-    for (index, line) in source.lines().enumerate() {
-        let line_number = index + 1;
-        let (has_code, has_comment) = scanner.scan_line(line);
+fn count_lines(lines: &[LineKind], test_lines: &BTreeSet<usize>) -> Counts {
+    let mut counts = Counts::default();
 
-        if has_code {
-            if test_lines.contains(&line_number) {
-                counts.tests += 1;
-            } else {
-                counts.code += 1;
-            }
-        } else if has_comment {
-            counts.comments += 1;
+    for (index, kind) in lines.iter().enumerate() {
+        let is_test = test_lines.contains(&(index + 1));
+
+        match kind {
+            LineKind::Code if is_test => counts.tests += 1,
+            LineKind::Code => counts.code += 1,
+            LineKind::Comment if !is_test => counts.comments += 1,
+            LineKind::Comment | LineKind::Blank => {}
         }
     }
 
@@ -712,6 +1063,33 @@ fn looks_like_char_literal(chars: &[char], index: usize) -> bool {
 mod tests {
     use super::*;
 
+    fn count_source(source: &str) -> syn::Result<Counts> {
+        Ok(ParsedSource::parse(source)?.counts())
+    }
+
+    fn items(source: &str) -> Vec<ItemCounts> {
+        ParsedSource::parse(source).unwrap().items()
+    }
+
+    fn item(
+        name: &str,
+        kind: &'static str,
+        line: usize,
+        prod: usize,
+        doc: usize,
+        cog: usize,
+    ) -> ItemCounts {
+        ItemCounts {
+            name: name.to_string(),
+            kind,
+            line,
+            prod,
+            doc,
+            cog,
+            items: Vec::new(),
+        }
+    }
+
     #[test]
     fn counts_code_comments_and_tests() {
         let source = r#"fn main() {
@@ -733,7 +1111,7 @@ mod tests {
             count_source(source).unwrap(),
             Counts {
                 code: 3,
-                comments: 2,
+                comments: 1,
                 tests: 7,
                 complexity: 0,
             }
@@ -881,6 +1259,64 @@ mod tests {
                 tests: 0,
                 complexity: 0,
             }
+        );
+    }
+
+    #[test]
+    fn lists_items_without_tests() {
+        let source = r#"use std::fmt;
+
+/// A point.
+struct Point {
+    x: i32,
+}
+
+// Leading comment.
+fn check(a: bool) -> bool {
+    if a { true } else { false }
+}
+
+impl<'a> From<&'a str>
+    for Point
+where
+    Point: Sized,
+{
+    fn from(_: &'a str) -> Self {
+        // Inner comment.
+        Point { x: 0 }
+    }
+}
+
+mod inner {
+    const LIMIT: usize = 3;
+
+    #[cfg(test)]
+    mod tests {}
+}
+
+#[test]
+fn ignored() {}
+
+#[cfg(test)]
+mod tests {
+    fn helper() {}
+}
+"#;
+
+        assert_eq!(
+            items(source),
+            vec![
+                item("Point", "struct", 4, 3, 1, 0),
+                item("check", "fn", 9, 3, 1, 2),
+                ItemCounts {
+                    items: vec![item("from", "fn", 18, 3, 1, 0)],
+                    ..item("impl<'a> From<&'a str> for Point", "impl", 13, 9, 1, 0)
+                },
+                ItemCounts {
+                    items: vec![item("LIMIT", "const", 25, 1, 0, 0)],
+                    ..item("inner", "mod", 24, 3, 0, 0)
+                },
+            ]
         );
     }
 }
